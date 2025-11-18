@@ -1,8 +1,8 @@
 # This version uses leastsq for parameters fitting.
-# interface points are neglected for fitting when calculating SSE, which attmpts to improve fitting quality.
-# There are totally 9 fitting parameters, which includes refractive indices and growth rates for three types of layers.
+# Interface points are excluded from fitting EXCEPT the first one (AsH3 to 1050nm transition).
+# There are totally 9 fitting parameters: refractive indices and growth rates for three types of layers.
+# Includes comprehensive fitting performance metrics: R², Adjusted R², RMSE, MAE, MAPE, etc.
 
-# The result of SSE reduction is about 88.1% (Although fewer fitting points will result in lower SSE))
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -33,36 +33,70 @@ df_log = df_log[df_log['Message'].isin(msg_list)][col_list].reset_index(drop=Tru
 
 # Create a column that marks True for the first occurrence in each continuous group of same EpiReflect values
 df_log['is_first_occurrence'] = df_log['EpiReflect1_9.Current Value'] != df_log['EpiReflect1_9.Current Value'].shift(1)
-first_occurrences = df_log[df_log['is_first_occurrence']]
-
-#print("First occurrences of new EpiReflect values:")
-#print(first_occurrences[['EpiReflect1_9.Current Value', 'Message']])
-
-
-# --- Simulation Parameters ---
-#N_sub = 3.679 - 0.52j
-#eta_m = N_sub / C
+first_occurrences = df_log[df_log['is_first_occurrence']].copy()
 
 # --- Identify Interface Points ---
 # Interface points: first occurrences where the message changed from the previous first occurrence
 # Skip the first point (index 0) since it has no previous value to compare
-first_occurrences_copy = first_occurrences.copy()
-first_occurrences_copy.loc[:, 'message_changed'] = first_occurrences_copy['Message'] != first_occurrences_copy['Message'].shift(1)
+first_occurrences.loc[:, 'message_changed'] = first_occurrences['Message'] != first_occurrences['Message'].shift(1)
 # Set first point to False (it's not an interface, just the start)
-first_occurrences_copy.iloc[0, first_occurrences_copy.columns.get_loc('message_changed')] = False
-interface_points = first_occurrences_copy[first_occurrences_copy['message_changed']].copy()
-first_occurrences = first_occurrences_copy
+first_occurrences.iloc[0, first_occurrences.columns.get_loc('message_changed')] = False
+
+# Identify the first interface point (AsH3 → 1050nm transition)
+first_interface_idx = first_occurrences[first_occurrences['message_changed']].index[0] if len(first_occurrences[first_occurrences['message_changed']]) > 0 else None
+
+# Mark interface points to exclude (all EXCEPT the first interface point)
+first_occurrences.loc[:, 'exclude_from_fitting'] = first_occurrences['message_changed'].copy()
+if first_interface_idx is not None:
+    first_occurrences.loc[first_interface_idx, 'exclude_from_fitting'] = False
+
+interface_points_excluded = first_occurrences[first_occurrences['exclude_from_fitting']].copy()
+interface_points_all = first_occurrences[first_occurrences['message_changed']].copy()
 
 print("\n" + "="*50)
-print("INTERFACE POINTS (Message Changes):")
+print("ALL INTERFACE POINTS (Message Changes):")
 print("="*50)
-print(interface_points[['EpiReflect1_9.Current Value', 'Message']])
+print(interface_points_all[['EpiReflect1_9.Current Value', 'Message']])
+
+print("\n" + "="*50)
+print("INTERFACE POINTS EXCLUDED FROM FITTING:")
+print("="*50)
+print(interface_points_excluded[['EpiReflect1_9.Current Value', 'Message']])
+
+print("\n" + "="*50)
+print("FIRST INTERFACE POINT (INCLUDED in fitting):")
+print("="*50)
+if first_interface_idx is not None:
+    print(first_occurrences.loc[first_interface_idx, ['EpiReflect1_9.Current Value', 'Message']])
+else:
+    print("None found")
 
 print("\n" + "="*50)
 print("ALL FIRST OCCURRENCES:")
 print("="*50)
 print(first_occurrences[['EpiReflect1_9.Current Value', 'Message']])
 
+# Find the actual transition indices (for visualization only)
+# Transition 1: 1050 nm InGaAsP -> 1178nm InGaAsP
+transition1_indices = df_log[df_log['Message'] == '1178nm InGaAsP'].index
+actual_transition1_index = transition1_indices[0] if len(transition1_indices) > 0 else 0
+
+# Transition 2: 1178nm InGaAsP -> 1050nm InGaAsP (second phase)
+transition2_indices = df_log[df_log['Message'] == '1050nm InGaAsP'].index
+actual_transition2_index = transition2_indices[0] if len(transition2_indices) > 0 else 0
+
+# Transition 3: 1050nm InGaAsP (second phase) -> InP cap
+transition3_indices = df_log[df_log['Message'] == 'InP cap'].index
+actual_transition3_index = transition3_indices[0] if len(transition3_indices) > 0 else 0
+
+print(f"\n" + "="*50)
+print("TRANSITION INDICES (for visualization only):")
+print("="*50)
+print(f"Transition 1 (1050nm -> 1178nm): index {actual_transition1_index}")
+print(f"Transition 2 (1178nm -> 1050nm second): index {actual_transition2_index}")
+print(f"Transition 3 (1050nm second -> InP cap): index {actual_transition3_index}")
+
+# --- Simulation Parameters ---
 eta_0 = 1 / C
 
 # --- Define Simulation Function ---
@@ -73,13 +107,15 @@ def simulate_reflectance(GR_1050=0.5, GR_1178=0.52, GR_InP=0.42,
     """
     Simulate reflectance with given parameters
     Returns array of reflectance values
+    Uses message-based layer selection only
     """
     M = np.eye(2, dtype=complex)
     reflectance_values = []
     
     for idx, row in df_log.iterrows():
         msg = row['Message']
-        # Set refractive index and growth rate based on message
+        
+        # Use message to determine layer type
         if '1050' in msg:
             N_j = N_1050_real - 1j * N_1050_imag
             GR_j = GR_1050
@@ -119,6 +155,7 @@ def lmfit_objective(params):
     """
     Objective function for lmfit: returns residuals (not SSE)
     lmfit minimizes sum of squares of residuals automatically
+    EXCLUDES interface points from fitting EXCEPT the first one (AsH3 → 1050nm)
     """
     # Extract parameter values
     GR_1050 = params['GR_1050'].value
@@ -137,8 +174,9 @@ def lmfit_objective(params):
                                    N_1178_real, N_1178_imag,
                                    N_sub_real, N_sub_imag)
     
-    # Get first occurrence indices and measured values, EXCLUDING interface points
-    fitting_points = first_occurrences[~first_occurrences['message_changed']].copy()
+    # Get first occurrence indices and measured values, EXCLUDING marked interface points
+    # (all interface points EXCEPT the first one)
+    fitting_points = first_occurrences[~first_occurrences['exclude_from_fitting']].copy()
     fitting_indices = fitting_points.index.values
     measured_fitting = fitting_points['EpiReflect1_9.Current Value'].values
     simulated_fitting = simulated[fitting_indices]
@@ -160,13 +198,16 @@ params.add('N_1050_imag', value=0.53, min=0.4, max=0.6)
 params.add('N_1178_real', value=3.95, min=3.9, max=4.1)
 params.add('N_1178_imag', value=0.55, min=0.4, max=0.6)
 # Refractive indices for substrate
-params.add('N_sub_real', value=3.679, min=3.6, max=3.8)  # Fixed
-params.add('N_sub_imag', value=0.52, min=0.3, max=0.6)   # Fixed
+params.add('N_sub_real', value=3.679, min=3.6, max=3.8)
+params.add('N_sub_imag', value=0.52, min=0.3, max=0.6)
 
 # --- Perform Optimization ---
 print("\n" + "="*50)
-print("STARTING LMFIT OPTIMIZATION")
+print("STARTING LMFIT OPTIMIZATION (9 PARAMETERS)")
 print("="*50)
+fitting_count = len(first_occurrences[~first_occurrences['exclude_from_fitting']])
+excluded_count = len(interface_points_excluded)
+print(f"Fitting points: {fitting_count} (excluding {excluded_count} interface points, keeping first interface point)")
 print("Initial parameters:")
 for name, param in params.items():
     print(f"  {name}: {param.value}")
@@ -174,12 +215,13 @@ for name, param in params.items():
 # Optimize using Levenberg-Marquardt algorithm
 print(f"\nRunning optimization...")
 
-result = minimize(lmfit_objective, params, method='lbfgsb')
+result = minimize(lmfit_objective, params, method='leastsq')
+#or bfgs: method='lbfgsb'
 
 print(f"Optimization completed!")
 print(f"Success: {result.success}")
 print(f"Number of function evaluations: {result.nfev}")
-print(f"Number of data points: {len(first_occurrences)}")
+print(f"Number of data points used for fitting: {fitting_count}")
 print(f"Number of fitted parameters: {len([p for p in result.params.values() if p.vary])}")
 
 # --- Display Results ---
@@ -200,7 +242,7 @@ print("="*50)
 print(fit_report(result))
 
 # --- Generate Simulation Data for Plotting ---
-# Initial simulation (original values)
+# Initial simulation (original values, no transition adjustment)
 initial_reflectance = simulate_reflectance()  # Uses default values
 df_sim_initial = pd.DataFrame({
     'Time (sec)': df_log.index,
@@ -255,54 +297,200 @@ fig.add_trace(go.Scatter(
     name='Optimized Simulation'
 ))
 
-# First occurrences with special markers (data used for fitting)
+# Non-interface first occurrences + first interface (data used for fitting) - green diamonds
+fitting_points_for_plot = first_occurrences[~first_occurrences['exclude_from_fitting']]
 fig.add_trace(go.Scatter(
-    x=first_occurrences.index,
-    y=first_occurrences['EpiReflect1_9.Current Value'],
+    x=fitting_points_for_plot.index,
+    y=fitting_points_for_plot['EpiReflect1_9.Current Value'],
     mode='markers',
-    marker=dict(size=8, color='red', symbol='diamond'),
+    marker=dict(size=8, color='green', symbol='diamond'),
     name='Fitting Data Points',
-    hovertext=first_occurrences['Message']
+    hovertext=fitting_points_for_plot['Message']
 ))
 
+# Interface points EXCLUDED from fitting - red X markers (not including first interface)
+fig.add_trace(go.Scatter(
+    x=interface_points_excluded.index,
+    y=interface_points_excluded['EpiReflect1_9.Current Value'],
+    mode='markers',
+    marker=dict(size=10, color='red', symbol='x'),
+    name='Interface Points (Excluded)',
+    hovertext=interface_points_excluded['Message']
+))
+
+# Add vertical lines to show transition points (for reference only)
+fig.add_vline(x=actual_transition1_index, line_dash="dash", line_color="orange", 
+              annotation_text="T1: 1050→1178", annotation_position="top left")
+fig.add_vline(x=actual_transition2_index, line_dash="dash", line_color="cyan", 
+              annotation_text="T2: 1178→1050", annotation_position="top")
+fig.add_vline(x=actual_transition3_index, line_dash="dash", line_color="magenta", 
+              annotation_text="T3: 1050→InP", annotation_position="top right")
+
 fig.update_layout(
-    width=1000, height=600,
-    xaxis_title='Time (sec)',
+    width=1400, height=600,
+    xaxis_title='Time Index',
     yaxis_title='Reflectance (%)',
-    title=f'7-Parameter Fitting Results (SSE reduction: {((np.sum(lmfit_objective(params)**2) - result.chisqr) / np.sum(lmfit_objective(params)**2) * 100):.1f}%)',
+    title=f'9-Parameter Fitting (First Interface Included) - SSE reduction: {((np.sum(lmfit_objective(params)**2) - result.chisqr) / np.sum(lmfit_objective(params)**2) * 100):.1f}%',
     legend=dict(x=0.98, y=0.98, xanchor='right', yanchor='top')
 )
 fig.show()
 
-# --- Print Summary Statistics ---
+# --- Calculate Comprehensive Performance Metrics ---
 print(f"\n" + "="*50)
-print("FITTING QUALITY SUMMARY")
+print("COMPREHENSIVE FITTING PERFORMANCE METRICS")
 print("="*50)
 
-# Calculate initial and final SSE
-initial_residuals = lmfit_objective(params)  # Initial parameters
-final_residuals = result.residual
-initial_sse = np.sum(initial_residuals**2)
-final_sse = result.chisqr  # Same as np.sum(final_residuals**2)
-improvement = (initial_sse - final_sse) / initial_sse * 100
+# Get fitting data
+fitting_points = first_occurrences[~first_occurrences['exclude_from_fitting']].copy()
+fitting_indices = fitting_points.index.values
+measured_fitting = fitting_points['EpiReflect1_9.Current Value'].values
 
-print(f"Initial SSE: {initial_sse:.6f}")
-print(f"Final SSE: {final_sse:.6f}")
-print(f"SSE improvement: {improvement:.1f}%")
-print(f"Reduced chi-square: {result.redchi:.6f}")
-print(f"Root Mean Square Error: {np.sqrt(final_sse/len(final_residuals)):.4f}")
+# Initial predictions
+simulated_initial = simulate_reflectance()
+predicted_initial = simulated_initial[fitting_indices]
+
+# Optimized predictions
+predicted_optimized = optimized_reflectance[fitting_indices]
+
+# Calculate metrics for FITTED points
+n = len(measured_fitting)  # number of observations
+p = len([param for param in result.params.values() if param.vary])  # number of parameters
+
+# Residuals
+residuals_initial = predicted_initial - measured_fitting
+residuals_optimized = predicted_optimized - measured_fitting
+
+# Sum of Squares
+SS_res_initial = np.sum(residuals_initial**2)  # Residual sum of squares (initial)
+SS_res_optimized = np.sum(residuals_optimized**2)  # Residual sum of squares (optimized)
+SS_tot = np.sum((measured_fitting - np.mean(measured_fitting))**2)  # Total sum of squares
+
+# R-squared (Coefficient of Determination)
+R2_initial = 1 - (SS_res_initial / SS_tot)
+R2_optimized = 1 - (SS_res_optimized / SS_tot)
+
+# Adjusted R-squared
+R2_adj_initial = 1 - (1 - R2_initial) * (n - 1) / (n - p - 1)
+R2_adj_optimized = 1 - (1 - R2_optimized) * (n - 1) / (n - p - 1)
+
+# Root Mean Square Error (RMSE)
+RMSE_initial = np.sqrt(SS_res_initial / n)
+RMSE_optimized = np.sqrt(SS_res_optimized / n)
+
+# Mean Absolute Error (MAE)
+MAE_initial = np.mean(np.abs(residuals_initial))
+MAE_optimized = np.mean(np.abs(residuals_optimized))
+
+# Mean Absolute Percentage Error (MAPE)
+MAPE_initial = np.mean(np.abs(residuals_initial / measured_fitting)) * 100
+MAPE_optimized = np.mean(np.abs(residuals_optimized / measured_fitting)) * 100
+
+# Maximum Absolute Error
+Max_Error_initial = np.max(np.abs(residuals_initial))
+Max_Error_optimized = np.max(np.abs(residuals_optimized))
+
+# Normalized RMSE (NRMSE) - normalized by range
+data_range = np.max(measured_fitting) - np.min(measured_fitting)
+NRMSE_initial = (RMSE_initial / data_range) * 100
+NRMSE_optimized = (RMSE_optimized / data_range) * 100
+
+print(f"\n{'Metric':<30} {'Initial':<15} {'Optimized':<15} {'Improvement':<15}")
+print("="*75)
+
+# R-squared
+print(f"{'R² (Coefficient of Det.)':<30} {R2_initial:<15.6f} {R2_optimized:<15.6f} {R2_optimized - R2_initial:+.6f}")
+
+# Adjusted R-squared
+print(f"{'Adjusted R²':<30} {R2_adj_initial:<15.6f} {R2_adj_optimized:<15.6f} {R2_adj_optimized - R2_adj_initial:+.6f}")
+
+# RMSE
+print(f"{'RMSE (%)':<30} {RMSE_initial:<15.4f} {RMSE_optimized:<15.4f} {RMSE_optimized - RMSE_initial:+.4f}")
+
+# MAE
+print(f"{'MAE (%)':<30} {MAE_initial:<15.4f} {MAE_optimized:<15.4f} {MAE_optimized - MAE_initial:+.4f}")
+
+# MAPE
+print(f"{'MAPE (%)':<30} {MAPE_initial:<15.4f} {MAPE_optimized:<15.4f} {MAPE_optimized - MAPE_initial:+.4f}")
+
+# NRMSE
+print(f"{'NRMSE (%)':<30} {NRMSE_initial:<15.4f} {NRMSE_optimized:<15.4f} {NRMSE_optimized - NRMSE_initial:+.4f}")
+
+# Max Error
+print(f"{'Max Absolute Error (%)':<30} {Max_Error_initial:<15.4f} {Max_Error_optimized:<15.4f} {Max_Error_optimized - Max_Error_initial:+.4f}")
+
+# SSE
+print(f"{'SSE (Sum of Sq. Errors)':<30} {SS_res_initial:<15.4f} {SS_res_optimized:<15.4f} {SS_res_optimized - SS_res_initial:+.4f}")
+
+print("\n" + "="*75)
+print("METRIC INTERPRETATIONS:")
+print("="*75)
+print(f"R²: {R2_optimized:.4f}")
+print("  → Explains {:.2f}% of variance in the data".format(R2_optimized * 100))
+print("  → 1.0 = perfect fit, 0.0 = no better than mean")
+print(f"\nAdjusted R²: {R2_adj_optimized:.4f}")
+print("  → Adjusted for number of parameters")
+print("  → Penalizes overfitting with too many parameters")
+print(f"\nRMSE: {RMSE_optimized:.4f}%")
+print("  → Average prediction error in same units as data")
+print("  → Lower is better")
+print(f"\nMAPE: {MAPE_optimized:.4f}%")
+print("  → Average percentage error")
+print("  → Scale-independent metric")
+print(f"\nNRMSE: {NRMSE_optimized:.4f}%")
+print("  → RMSE normalized by data range")
+print("  → <10% = excellent, 10-20% = good, 20-30% = fair, >30% = poor")
+
+# --- Calculate SSE on ALL first occurrence points (for fair comparison) ---
+print(f"\n" + "="*50)
+print("SSE ON ALL POINTS (Fair Comparison)")
+print("="*50)
+
+all_indices = first_occurrences.index.values
+measured_all = first_occurrences['EpiReflect1_9.Current Value'].values
+simulated_all_initial = simulate_reflectance()
+simulated_all_optimized = simulate_reflectance(
+    result.params['GR_1050'].value,
+    result.params['GR_1178'].value,
+    result.params['GR_InP'].value,
+    result.params['N_1050_real'].value,
+    result.params['N_1050_imag'].value,
+    result.params['N_1178_real'].value,
+    result.params['N_1178_imag'].value,
+    result.params['N_sub_real'].value,
+    result.params['N_sub_imag'].value
+)
+residuals_all_initial = simulated_all_initial[all_indices] - measured_all
+residuals_all_optimized = simulated_all_optimized[all_indices] - measured_all
+sse_all_initial = np.sum(residuals_all_initial**2)
+sse_all_optimized = np.sum(residuals_all_optimized**2)
+improvement_all = (sse_all_initial - sse_all_optimized) / sse_all_initial * 100
+
+# R² for all points
+SS_tot_all = np.sum((measured_all - np.mean(measured_all))**2)
+R2_all_initial = 1 - (sse_all_initial / SS_tot_all)
+R2_all_optimized = 1 - (sse_all_optimized / SS_tot_all)
+
+print(f"SSE on ALL points (including all interface points):")
+print(f"  Initial SSE: {sse_all_initial:.6f}")
+print(f"  Optimized SSE: {sse_all_optimized:.6f}")
+print(f"  SSE improvement: {improvement_all:.2f}%")
+print(f"\nR² on ALL points:")
+print(f"  Initial R²: {R2_all_initial:.6f}")
+print(f"  Optimized R²: {R2_all_optimized:.6f}")
+print(f"  R² improvement: {R2_all_optimized - R2_all_initial:+.6f}")
 
 if hasattr(result, 'aic'):
-    print(f"AIC (Akaike Information Criterion): {result.aic:.2f}")
+    print(f"\nAIC (Akaike Information Criterion): {result.aic:.2f}")
 if hasattr(result, 'bic'):
     print(f"BIC (Bayesian Information Criterion): {result.bic:.2f}")
 
-print(f"\nParameter Changes:")
-param_names = ['GR_1050', 'GR_1178', 'GR_InP', 'N_1050_real', 'N_1050_imag', 'N_1178_real', 'N_1178_imag']
-initial_vals = [0.5, 0.52, 0.42, 3.84, 0.53, 3.95, 0.55]
+print(f"\n" + "="*50)
+print("PARAMETER CHANGES:")
+print("="*50)
+param_names = ['GR_1050', 'GR_1178', 'GR_InP', 'N_1050_real', 'N_1050_imag', 'N_1178_real', 'N_1178_imag', 'N_sub_real', 'N_sub_imag']
+initial_vals = [0.5, 0.52, 0.42, 3.84, 0.53, 3.95, 0.55, 3.679, 0.52]
 for name, initial_val in zip(param_names, initial_vals):
     if result.params[name].vary:
         final_val = result.params[name].value
         change = ((final_val - initial_val) / initial_val) * 100
         print(f"  {name}: {initial_val:.4f} → {final_val:.4f} ({change:+.1f}%)")
-
