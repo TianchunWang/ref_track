@@ -1,162 +1,105 @@
-# 9-parameter fitting using lmfit
-# Interface points excluded from fitting except the first one (AsH3 to 1050nm transition)
-
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from lmfit import Parameters, minimize
-
-# --- Column---
-REFLECTANCE_COLUMN = 'EpiReflect1_9.Current Value'  # Change this to match your data column name
+from lmfit import Parameters, minimize, fit_report
 
 # --- Constants ---
-WAVELENGTH = 633.0e-9 # WG
-C = 2.998e8
+WAVELENGTH = 633.0e-9  # nm
+C = 2.998e8            # m/sec
 PI = np.pi
 
-# Read layer as initial (trial) parameters
+# --- Read Layer Data ---
 df_layer = pd.read_csv('layers.csv', index_col='index')
+print(df_layer)
 
+# --- Read and Filter Log Data ---
 df_log = pd.read_csv('2025.2025-05.C2721_HL13B5-WG_L2_C2721_HL13B5-WG_L2_2913.csv')
 
-# Filter log data by message
-msg_list = ['introduce AsH3', 
-            '1050 nm InGaAsP', 
-            '1178nm InGaAsP', 
-            '1050nm InGaAsP', 
-            'InP cap']
-col_list = ['Time (rel)', REFLECTANCE_COLUMN, 'Message']
+msg_list = [
+    'introduce AsH3',
+    '1050 nm InGaAsP',
+    '1178nm InGaAsP',
+    '1050nm InGaAsP',
+    'InP cap'
+]
+message_map = {msg: idx for idx, msg in enumerate(msg_list)}
+
+col_list = ['Time (rel)', 'EpiReflect1_9.Current Value', 'Message']
 
 df_log = df_log[df_log['Message'].isin(msg_list)][col_list].reset_index(drop=True)
+df_log['is_first_occurrence'] = df_log['EpiReflect1_9.Current Value'] != df_log['EpiReflect1_9.Current Value'].shift(1)
+df_log['time_index'] = df_log.index
+#df_log = df_log[df_log['is_first_occurrence']].reset_index(drop=True)
 
+df_log['message_numeric'] = df_log['Message'].map(message_map)
+message_changed = df_log['message_numeric'] != df_log['message_numeric'].shift(1)
 
-df_log[REFLECTANCE_COLUMN] = df_log[REFLECTANCE_COLUMN] 
+df_dup = df_log.copy()
 
-# Identify First Occurrences and Interface Points
-df_log['is_first_occurrence'] = df_log[REFLECTANCE_COLUMN] != df_log[REFLECTANCE_COLUMN].shift(1)
+df_1050_first = df_dup[df_dup['Message'] == '1050 nm InGaAsP'].copy()
+df_1050_second = df_dup[df_dup['Message'] == '1050nm InGaAsP'].copy()
+df_1178 = df_dup[df_dup['Message'] == '1178nm InGaAsP'].copy()
+df_InP = df_dup[df_dup['Message'] == 'InP cap'].copy()
+
+print("\n" + "="*50)
+print("DATA SEPARATION BY LAYER TYPE")
+print("="*50)
+print(f"1050nm (first phase) data points: {len(df_1050_first)}")
+print(f"1050nm (second phase) data points: {len(df_1050_second)}")
+print(f"1178nm InGaAsP data points: {len(df_1178)}")
+print(f"InP cap data points: {len(df_InP)}")
+print(f"Total: {len(df_1050_first) + len(df_1050_second) + len(df_1178) + len(df_InP)}")
+
+exit()
+# Method 1: See all rows where message changed
+#print("Rows where message changed:")
+#print(df_log[message_changed])
+
 first_occurrences = df_log[df_log['is_first_occurrence']].copy()
+# Create truncated dataframes for simulation and fitting
+#df_log_step1 = df_log[(df_log['message_numeric'] == 1) | (df_log['message_numeric'] == 0) | (df_log['message_numeric'] == 2)].copy()
+df_log_step1 = df_log.copy()
 
-# Mark interface points (message changes)
-first_occurrences['message_changed'] = first_occurrences['Message'] != first_occurrences['Message'].shift(1)
-first_occurrences.iloc[0, first_occurrences.columns.get_loc('message_changed')] = False
 
-# Exclude all interface points EXCEPT the first one
-first_occurrences['exclude_from_fitting'] = first_occurrences['message_changed']
-first_interface_idx = first_occurrences[first_occurrences['message_changed']].index[0]
-first_occurrences.loc[first_interface_idx, 'exclude_from_fitting'] = False
+#df_log_step1 = first_occurrences[first_occurrences['message_numeric'] == 1].copy().reset_index(drop=True)
 
-# Get points for visualization
-interface_excluded = first_occurrences[first_occurrences['exclude_from_fitting']]
-interface_points = first_occurrences[first_occurrences['message_changed']].copy()
-
-# --- Simulation Function ---
+#print(f"Fitting data indices: {df_log_step1['time_index'].values}")
+# --- Simulation Parameters ---
+N_sub = 3.679 - 0.52j
+eta_m = N_sub / C
 eta_0 = 1 / C
 
-def initial_reflectance(GR_1050=0.5, GR_1178=0.52, GR_InP=0.42, 
-                        N_1050_real=3.84, N_1050_imag=0.53, 
-                        N_1178_real=3.95, N_1178_imag=0.55,
-                        N_sub_real=3.679, N_sub_imag=0.52):
-    M = np.eye(2, dtype=complex)
-    reflectance_values = []
-    
-    for idx, (_, row) in enumerate(df_log.iterrows()):
-        msg = row['Message']
-        
-        if '1050' in msg:
-            N_j, GR_j = N_1050_real - 1j * N_1050_imag, GR_1050
-        elif '1178' in msg:
-            N_j, GR_j = N_1178_real - 1j * N_1178_imag, GR_1178
-        elif 'InP' in msg:
-            N_j, GR_j = N_sub_real - 1j * N_sub_imag, GR_InP
-        else:
-            N_j, GR_j = 1.0, 0.0
-
-        d = GR_j * 1.0e-9
-        delta_j = 2 * PI * N_j * d / WAVELENGTH
-        eta_j = N_j / C
-        eta_m = (N_sub_real - 1j * N_sub_imag) / C
-
-        M_j = np.array([
-            [np.cos(delta_j), 1j * np.sin(delta_j) / eta_j],
-            [1j * eta_j * np.sin(delta_j), np.cos(delta_j)]
-        ])
-        M = M_j @ M
-
-        BC = M @ np.array([1, eta_m])
-        rho = (BC[0] * eta_0 - BC[1]) / (BC[0] * eta_0 + BC[1])
-        
-        # Apply 0.865 scaling factor only to the first row
-
-        R = np.vdot(rho, rho).real * 100 *0.865
-
-        reflectance_values.append(R)
-    
-    return np.array(reflectance_values)
-
-print("\nCalculating initial simulation with default parameters...")
-initial_simulation = initial_reflectance()
-
-first_raw = df_log[REFLECTANCE_COLUMN].iloc[0]
-norm_ratio = first_raw / initial_simulation[0]
-print(f"Normalization ratio (first point): {norm_ratio:.4f}")
-
-
-
-'''# Extract statistics
-raw_min = raw_data.min()
-raw_max = raw_data.max()
-raw_first = raw_data.iloc[0]
-raw_mean = raw_data.mean()
-raw_range = raw_max - raw_min
-
-sim_min = initial_simulation.min()
-sim_max = initial_simulation.max()
-sim_first = initial_simulation[0]
-sim_mean = initial_simulation.mean()
-sim_range = sim_max - sim_min
-
-# Calculate ratios
-ratio_min = raw_min / sim_min if sim_min != 0 else np.nan
-ratio_max = raw_max / sim_max if sim_max != 0 else np.nan
-ratio_first = raw_first / sim_first if sim_first != 0 else np.nan
-ratio_mean = raw_mean / sim_mean if sim_mean != 0 else np.nan
-ratio_range = raw_range / sim_range if sim_range != 0 else np.nan
-
-print(raw_min, raw_max, raw_first, raw_range)
-print(sim_min, sim_max, sim_first, sim_range)
-print(raw_min/sim_min)
-print(raw_max/sim_max)
-print(raw_first/sim_first)
-print(raw_range/sim_range)
-
-'''
-
-# Normalization
-
-
+# --- Define Simulation Function (Uses Truncated Data Only) ---
 def simulate_reflectance(GR_1050=0.5, GR_1178=0.52, GR_InP=0.42, 
-                        N_1050_real=3.84, N_1050_imag=0.53, 
-                        N_1178_real=3.95, N_1178_imag=0.55,
-                        N_sub_real=3.679, N_sub_imag=0.52):
+                              N_1050_real=3.84, N_1050_imag=0.53, 
+                              N_1178_real=3.95, N_1178_imag=0.55,
+                              N_sub_real=3.679, N_sub_imag=0.52):
+    """
+    Simulate reflectance for step 1 data only
+    """
     M = np.eye(2, dtype=complex)
     reflectance_values = []
     
-    for idx, (_, row) in enumerate(df_log.iterrows()):
+    # Simulate all data up to each step 1 point
+    for idx, row in df_log_step1.iterrows():
         msg = row['Message']
         
         if '1050' in msg:
-            N_j, GR_j = N_1050_real - 1j * N_1050_imag, GR_1050
+            N_j = N_1050_real - 1j * N_1050_imag
+            GR_j = GR_1050
         elif '1178' in msg:
-            N_j, GR_j = N_1178_real - 1j * N_1178_imag, GR_1178
+            N_j = N_1178_real - 1j * N_1178_imag
+            GR_j = GR_1178
         elif 'InP' in msg:
-            N_j, GR_j = N_sub_real - 1j * N_sub_imag, GR_InP
+            N_j = N_sub_real - 1j * N_sub_imag
+            GR_j = GR_InP
         else:
-            N_j, GR_j = 1.0, 0.0
+            N_j = 1.0 + 0j
+            GR_j = 0.0
 
-        d = GR_j * 1.0e-9
+        d = GR_j * 1.0e-9  # Convert nm to meters
         delta_j = 2 * PI * N_j * d / WAVELENGTH
         eta_j = N_j / C
-        eta_m = (N_sub_real - 1j * N_sub_imag) / C
 
         M_j = np.array([
             [np.cos(delta_j), 1j * np.sin(delta_j) / eta_j],
@@ -165,190 +108,277 @@ def simulate_reflectance(GR_1050=0.5, GR_1178=0.52, GR_InP=0.42,
         M = M_j @ M
 
         BC = M @ np.array([1, eta_m])
-        rho = (BC[0] * eta_0 - BC[1]) / (BC[0] * eta_0 + BC[1])
-        
-        # Apply 0.865 scaling factor only to the first row
-
-        R = np.vdot(rho, rho).real * 100  *0.865
-
-        
+        B_val, C_val = BC[0], BC[1]
+        rho = (B_val * eta_0 - C_val) / (B_val * eta_0 + C_val)
+        R = np.vdot(rho, rho).real * 100 * 0.865  # Scale factor
+    
         reflectance_values.append(R)
     
     return np.array(reflectance_values)
-
-# --- Objective Function ---
+# --- Define Objective Function for lmfit ---
 def lmfit_objective(params):
-    simulated = simulate_reflectance(
-        params['GR_1050'].value, params['GR_1178'].value, params['GR_InP'].value,
-        params['N_1050_real'].value, params['N_1050_imag'].value,
-        params['N_1178_real'].value, params['N_1178_imag'].value,
-        params['N_sub_real'].value, params['N_sub_imag'].value
-    )
+    """
+    Objective function for lmfit: returns residuals (not SSE)
+    Uses only first occurrences from truncated data for fitting
+    """
+    # Extract parameter values
+    GR_1050 = params['GR_1050'].value
+    GR_1178 = params['GR_1178'].value 
+    GR_InP = params['GR_InP'].value
+    N_1050_real = params['N_1050_real'].value
+    N_1050_imag = params['N_1050_imag'].value
+    N_1178_real = params['N_1178_real'].value
+    N_1178_imag = params['N_1178_imag'].value
+    N_InP_real = params['N_InP_real'].value
+    N_InP_imag = params['N_InP_imag'].value
     
-    fitting_points = first_occurrences[~first_occurrences['exclude_from_fitting']]
-    measured = fitting_points[REFLECTANCE_COLUMN].values
-    simulated_fit = simulated[fitting_points.index.values]
+    # Get full simulation for truncated data
+    simulated = simulate_reflectance(GR_1050, GR_1178, GR_InP,
+                                         N_1050_real, N_1050_imag,
+                                         N_1178_real, N_1178_imag,
+                                         N_InP_real, N_InP_imag)
     
-    return simulated_fit - measured
+    # Build mapping from original indices to simulation indices
+    first_occ_data = df_log_step1[df_log_step1['is_first_occurrence']]
 
-# --- Setup Parameters ---
+    # Filter to only include indices between 128 and 158 (inclusive)
+    index_mask = (first_occ_data.index <= 121) | (first_occ_data.index >= 128) & (first_occ_data.index <= 506)
+    
+    first_occ_data = first_occ_data[index_mask]
+
+    first_indices = first_occ_data.index.values
+    measured_first = first_occ_data['EpiReflect1_9.Current Value'].values
+
+
+    #first_occ_data = df_log_step1[df_log_step1['is_first_occurrence']]
+    #first_indices = first_occ_data.index.values
+    #measured_first = first_occ_data['EpiReflect1_9.Current Value'].values
+
+    simulated_first = simulated[first_indices]
+
+    
+
+    # Return residuals (differences), not SSE
+    residuals = simulated_first - measured_first
+    return residuals
+
+# --- Setup Fitting Parameters ---
 params = Parameters()
-params.add('GR_1050', value=0.5, min=0.3, max=0.7)
-params.add('GR_1178', value=0.52, min=0.3, max=0.7)
-params.add('GR_InP', value=0.42, min=0.2, max=0.6)
-params.add('N_1050_real', value=3.84, min=3.5, max=4.0)
-params.add('N_1050_imag', value=0.53, min=0.3, max=0.8)
-params.add('N_1178_real', value=3.95, min=3.5, max=4.2)
-params.add('N_1178_imag', value=0.55, min=0.3, max=0.8)
-params.add('N_sub_real', value=3.679, min=3.4, max=3.9)
-params.add('N_sub_imag', value=0.52, min=0.3, max=0.8)
+# Growth rates
+params.add('GR_1050', value=0.5, min=0.1, max=1.0)
+params.add('GR_1178', value=0.52, min=0.1, max=1.0)
+params.add('GR_InP', value=0.42, min=0.1, max=1.0)
+# Refractive indices for 1050nm layer
+params.add('N_1050_real', value=3.84, min=3.8, max=4.0)
+params.add('N_1050_imag', value=0.53, min=0.4, max=0.6)
+# Refractive indices for 1178nm layer
+params.add('N_1178_real', value=3.95, min=3.9, max=4.1)
+params.add('N_1178_imag', value=0.55, min=0.4, max=0.6)
+#Refractive indices for InP layer
+params.add('N_InP_real', value=3.679, min=3.5, max=3.8)
+params.add('N_InP_imag', value=0.52, min=0.4, max=0.6)
 
-
-# --- Calculate Initial Simulation (BEFORE fitting) ---
-print("\nCalculating initial simulation with default parameters...")
-initial_simulation = initial_reflectance()  # Uses default parameters
-
-
-# --- Perform Fitting ---
-print("\nStarting optimization...")
-result = minimize(lmfit_objective, params, method='leastsq')
+# --- Perform Optimization ---
 print("\n" + "="*50)
-print("FITTING RESULTS")
+print("STARTING LMFIT OPTIMIZATION")
 print("="*50)
-print(result.params.pretty_print())
+print("Initial parameters:")
+for name, param in params.items():
+    print(f"  {name}: {param.value}")
 
-# --- Generate Optimized Reflectance ---
-optimized_reflectance = simulate_reflectance(
-    result.params['GR_1050'].value, result.params['GR_1178'].value, result.params['GR_InP'].value,
-    result.params['N_1050_real'].value, result.params['N_1050_imag'].value,
-    result.params['N_1178_real'].value, result.params['N_1178_imag'].value,
-    result.params['N_sub_real'].value, result.params['N_sub_imag'].value
+# Optimize using Levenberg-Marquardt algorithm
+print(f"\nRunning optimization...")
+result = minimize(lmfit_objective, params, method='leastsq')
+
+print(f"Optimization completed!")
+print(f"Success: {result.success}")
+print(f"Number of function evaluations: {result.nfev}")
+print(f"Number of data points: {len(df_log_step1)}")
+print(f"Number of fitted parameters: {len([p for p in result.params.values() if p.vary])}")
+
+# --- Display Results ---
+print(f"\n" + "="*50)
+print("OPTIMIZED PARAMETERS")
+print("="*50)
+for name, param in result.params.items():
+    if param.vary:
+        stderr_str = f" ± {param.stderr:.4f}" if param.stderr else " ± N/A"
+        print(f"  {name}: {param.value:.4f}{stderr_str}")
+    else:
+        print(f"  {name}: {param.value:.4f} (fixed)")
+
+# Print detailed fit report
+print(f"\n" + "="*50)
+print("DETAILED FIT REPORT")
+print("="*50)
+print(fit_report(result))
+
+# --- Generate Simulation Data for Plotting ---
+# Initial simulation (original values) - uses truncated data
+if result is not None:
+    # Initial simulation for step 1
+    initial_reflectance_step1 = simulate_reflectance()
+    df_sim_initial_step1 = pd.DataFrame({
+        'Time (sec)': df_log_step1.index,
+        'Reflectance (%)': initial_reflectance_step1
+    })
+
+    # Optimized simulation for step 1
+    optimized_reflectance_step1 = simulate_reflectance(
+        result.params['GR_1050'].value,
+        result.params['GR_1178'].value,
+        result.params['GR_InP'].value,
+        result.params['N_1050_real'].value,
+        result.params['N_1050_imag'].value,
+        result.params['N_1178_real'].value,
+        result.params['N_1178_imag'].value,
+        result.params['N_InP_real'].value,
+        result.params['N_InP_imag'].value
+    )
+    df_sim_optimized_step1 = pd.DataFrame({
+        'Time (sec)': df_log_step1.index,
+        'Reflectance (%)': optimized_reflectance_step1
+    })
+else:
+    df_sim_initial = pd.DataFrame({'Time (sec)': [], 'Reflectance (%)': []})
+    df_sim_optimized= pd.DataFrame({'Time (sec)': [], 'Reflectance (%)': []})
+
+print("Step 1 measured values:")
+print(df_log_step1['EpiReflect1_9.Current Value'].values)
+print("Step 1 simulated values (initial):")
+print(simulate_reflectance())
+
+
+# Remove the exit() statement and replace the plotting section with this:
+
+# --- Plot Results ---
+fig = go.Figure()
+
+# All measured data points in light grey (background)
+fig.add_trace(go.Scatter(
+    x=df_log.index,
+    y=df_log['EpiReflect1_9.Current Value'],
+    hovertext=df_log['Message'],
+    mode='markers',
+    marker=dict(size=4, color='lightgrey'),
+    name='All Measured Points'
+))
+
+# First occurrences with special markers (data used for fitting) - like second code
+first_occurrence_points = df_log_step1[df_log_step1['is_first_occurrence']]
+fig.add_trace(go.Scatter(
+    x=first_occurrence_points.index,
+    y=first_occurrence_points['EpiReflect1_9.Current Value'],
+    mode='markers',
+    marker=dict(size=8, color='red', symbol='diamond'),
+    name='Fitting Data Points',
+    hovertext=first_occurrence_points['Message']
+))
+
+# Initial simulation (dashed blue line) - only for step 1 points
+if result is not None:
+    fig.add_trace(go.Scatter(
+        x=df_sim_initial_step1['Time (sec)'],
+        y=df_sim_initial_step1['Reflectance (%)'],
+        mode='lines',
+        line=dict(color='blue', dash='dash', width=2),
+        marker=dict(size=6, color='blue'),
+        name='Initial Simulation'
+    ))
+
+    # Optimized simulation (solid green line) - only for step 1 points
+    fig.add_trace(go.Scatter(
+        x=df_sim_optimized_step1['Time (sec)'],
+        y=df_sim_optimized_step1['Reflectance (%)'],
+        mode='lines',
+        line=dict(color='green', width=3),
+        marker=dict(size=6, color='green'),
+        name='Optimized Simulation'
+    ))
+
+    # Calculate improvement for title
+    initial_residuals = lmfit_objective(params)
+    final_residuals = result.residual
+    initial_sse = np.sum(initial_residuals**2)
+    final_sse = np.sum(final_residuals**2)
+    improvement = ((initial_sse - final_sse) / initial_sse * 100) if initial_sse > 0 else 0
+    
+    title_text = f'Step 1 Data Fitting Results (SSE reduction: {improvement:.1f}%)'
+else:
+    title_text = 'Step 1 Data Fitting Results'
+
+# Add step labels as annotations for step 1 data
+for idx, row in first_occurrence_points.iterrows():
+    # Create short labels for each step
+    if 'introduce AsH3' in row['Message']:
+        label = 'AsH3'
+    elif '1050' in row['Message']:
+        label = '1050nm'
+    elif '1178' in row['Message']:
+        label = '1178nm'
+    elif 'InP' in row['Message']:
+        label = 'InP'
+    else:
+        label = 'Other'
+    
+    fig.add_annotation(
+        x=idx,
+        y=row['EpiReflect1_9.Current Value'],
+        text=label,
+        showarrow=True,
+        arrowhead=2,
+        arrowsize=1,
+        arrowwidth=1,
+        arrowcolor='red',
+        ax=0,
+        ay=-30,
+        font=dict(size=10, color='red'),
+        bgcolor='white',
+        bordercolor='red',
+        borderwidth=1
+    )
+
+fig.update_layout(
+    width=1000, height=600,
+    xaxis_title='Time Index',
+    yaxis_title='Reflectance (%)',
+    title=title_text,
+    legend=dict(x=0.98, y=0.98, xanchor='right', yanchor='top')
 )
 
-# Print max and min values
-print(f"\n" + "="*50)
-print("SIMULATION STATISTICS")
-print("="*50)
-print(f"Initial Simulation:")
-print(f"  Min: {initial_simulation.min():.4f}%")
-print(f"  Max: {initial_simulation.max():.4f}%")
-print(f"  Range: {initial_simulation.max() - initial_simulation.min():.4f}%")
-print(f"  Mean: {initial_simulation.mean():.4f}%")
-
-print(f"\nOptimized Simulation:")
-print(f"  Min: {optimized_reflectance.min():.4f}%")
-print(f"  Max: {optimized_reflectance.max():.4f}%")
-print(f"  Range: {optimized_reflectance.max() - optimized_reflectance.min():.4f}%")
-print(f"  Mean: {optimized_reflectance.mean():.4f}%")
-
-print(f"\nMeasured Data:")
-print(f"  Min: {df_log[REFLECTANCE_COLUMN].min():.4f}%")
-print(f"  Max: {df_log[REFLECTANCE_COLUMN].max():.4f}%")
-print(f"  Range: {df_log[REFLECTANCE_COLUMN].max() - df_log[REFLECTANCE_COLUMN].min():.4f}%")
-print(f"  Mean: {df_log[REFLECTANCE_COLUMN].mean():.4f}%")
-
-# --- Visualization ---
-fitting_points_plot = first_occurrences[~first_occurrences['exclude_from_fitting']]
-
-fig = go.Figure()
-fig.add_trace(go.Scatter(x=df_log.index, y=df_log[REFLECTANCE_COLUMN],
-                         mode='markers', name='Measured', marker=dict(color='lightgrey', size=4),
-                         hovertext=df_log['Message'], hovertemplate='%{hovertext}<br>Reflectance: %{y:.4f}%'))
-fig.add_trace(go.Scatter(x=df_log.index, y=optimized_reflectance,
-                         mode='lines', name='Optimized Fit', line=dict(color='red', width=2)))
-fig.add_trace(go.Scatter(x=fitting_points_plot.index, 
-                         y=fitting_points_plot[REFLECTANCE_COLUMN],
-                         mode='markers', marker=dict(size=8, color='green', symbol='circle'),
-                         name='Fitting Data Points', hovertext=fitting_points_plot['Message']))
-fig.add_trace(go.Scatter(x=interface_excluded.index,
-                         y=interface_excluded[REFLECTANCE_COLUMN],
-                         mode='markers', marker=dict(size=10, color='red', symbol='x'),
-                         name='Interface Points (Excluded)', hovertext=interface_excluded['Message']))
-fig.add_trace(go.Scatter(x=df_log.index, y=initial_simulation,
-                         mode='lines', name='Initial Simulation', 
-                         line=dict(color='blue', width=2, dash='dash')))
-
-# Add transition lines
-colors = ["orange", "cyan", "magenta", "purple", "brown"]
-for i, (idx, row) in enumerate(interface_points.iterrows()):
-    color = colors[i % len(colors)]
-    prev_msg = first_occurrences.loc[first_occurrences.index < idx, 'Message'].iloc[-1] if len(first_occurrences.loc[first_occurrences.index < idx]) > 0 else "Start"
-    curr_msg = row['Message']
-    
-    # Create transition label
-    annotation_text = f"{prev_msg} → {curr_msg}"
-    annotation_position = "top left" if i % 2 == 0 else "top right"
-    
-    fig.add_vline(x=idx, line_dash="dash", line_color=color,
-                  annotation_text=annotation_text, 
-                  annotation_position=annotation_position)
-
-fig.update_layout(width=1400, height=600, xaxis_title='Time Index', yaxis_title='Reflectance (%)',
-                  title='9-Parameter Fitting (First Interface Included)',
-                  legend=dict(x=0.98, y=0.98, xanchor='right', yanchor='top'))
 fig.show()
 
-# --- Performance Metrics ---
+# --- Print Summary Statistics ---
 print(f"\n" + "="*50)
-print("FITTING PERFORMANCE METRICS")
+print("FITTING QUALITY SUMMARY")
 print("="*50)
 
-fitting_points = first_occurrences[~first_occurrences['exclude_from_fitting']]
-measured = fitting_points[REFLECTANCE_COLUMN].values
-predicted_initial = simulate_reflectance()[fitting_points.index.values]
-predicted_optimized = optimized_reflectance[fitting_points.index.values]
+if result is not None:
+    # Calculate initial and final SSE
+    initial_residuals = lmfit_objective(params)
+    final_residuals = result.residual
+    initial_sse = np.sum(initial_residuals**2)
+    final_sse = np.sum(final_residuals**2)
+    improvement = ((initial_sse - final_sse) / initial_sse * 100) if initial_sse > 0 else 0
 
-n = len(measured)
-p = len([param for param in result.params.values() if param.vary])
+    print(f"Initial SSE: {initial_sse:.6f}")
+    print(f"Final SSE: {final_sse:.6f}")
+    print(f"SSE improvement: {improvement:.1f}%")
+    print(f"Reduced chi-square: {result.redchi:.6f}")
+    print(f"Root Mean Square Error: {np.sqrt(final_sse/len(final_residuals)):.4f}")
 
-# Calculate metrics
-residuals_initial = predicted_initial - measured
-residuals_optimized = predicted_optimized - measured
+    if hasattr(result, 'aic'):
+        print(f"AIC (Akaike Information Criterion): {result.aic:.2f}")
+    if hasattr(result, 'bic'):
+        print(f"BIC (Bayesian Information Criterion): {result.bic:.2f}")
 
-SS_res_initial = np.sum(residuals_initial**2)
-SS_res_optimized = np.sum(residuals_optimized**2)
-SS_tot = np.sum((measured - np.mean(measured))**2)
-
-R2_initial = 1 - (SS_res_initial / SS_tot)
-R2_optimized = 1 - (SS_res_optimized / SS_tot)
-R2_adj_optimized = 1 - (1 - R2_optimized) * (n - 1) / (n - p - 1)
-
-RMSE_initial = np.sqrt(SS_res_initial / n)
-RMSE_optimized = np.sqrt(SS_res_optimized / n)
-MAE_optimized = np.mean(np.abs(residuals_optimized))
-MAPE_optimized = np.mean(np.abs(residuals_optimized / measured)) * 100
-
-data_range = np.max(measured) - np.min(measured)
-NRMSE_optimized = (RMSE_optimized / data_range) * 100
-
-print(f"{'Metric':<30} {'Initial':<15} {'Optimized':<15} {'Improvement (%)'}")
-print("="*75)
-R2_improvement = ((R2_optimized - R2_initial) / abs(R2_initial)) * 100 if R2_initial != 0 else 0
-RMSE_improvement = ((RMSE_initial - RMSE_optimized) / RMSE_initial) * 100
-SSE_improvement = ((SS_res_initial - SS_res_optimized) / SS_res_initial) * 100
-
-print(f"{'R²':<30} {R2_initial:<15.6f} {R2_optimized:<15.6f} {R2_improvement:+.2f}%")
-print(f"{'Adjusted R²':<30} {'-':<15} {R2_adj_optimized:<15.6f} {'-'}")
-print(f"{'RMSE (%)':<30} {RMSE_initial:<15.4f} {RMSE_optimized:<15.4f} {RMSE_improvement:+.2f}%")
-print(f"{'MAE (%)':<30} {'-':<15} {MAE_optimized:<15.4f} {'-'}")
-print(f"{'MAPE (%)':<30} {'-':<15} {MAPE_optimized:<15.4f} {'-'}")
-print(f"{'NRMSE (%)':<30} {'-':<15} {NRMSE_optimized:<15.4f} {'-'}")
-print(f"{'SSE':<30} {SS_res_initial:<15.4f} {SS_res_optimized:<15.4f} {SSE_improvement:+.2f}%")
-
-print(f"\nR² = {R2_optimized:.4f} (explains {R2_optimized*100:.2f}% of variance)")
-print(f"NRMSE = {NRMSE_optimized:.2f}% ({'excellent' if NRMSE_optimized < 10 else 'good' if NRMSE_optimized < 20 else 'fair' if NRMSE_optimized < 30 else 'poor'})")
-
-# Parameter changes
-print(f"\n" + "="*50)
-print("PARAMETER CHANGES")
-print("="*50)
-initial_vals = {'GR_1050': 0.5, 'GR_1178': 0.52, 'GR_InP': 0.42, 
-                'N_1050_real': 3.84, 'N_1050_imag': 0.53,
-                'N_1178_real': 3.95, 'N_1178_imag': 0.55,
-                'N_sub_real': 3.679, 'N_sub_imag': 0.52}
-
-for name, initial_val in initial_vals.items():
-    if result.params[name].vary:
-        final_val = result.params[name].value
-        change = ((final_val - initial_val) / initial_val) * 100
-        print(f"  {name}: {initial_val:.4f} → {final_val:.4f} ({change:+.1f}%)")
+    print(f"\nParameter Changes:")
+    param_names = ['GR_1050', 'GR_1178', 'GR_InP', 'N_1050_real', 'N_1050_imag', 'N_1178_real', 'N_1178_imag']
+    initial_vals = [0.5, 0.52, 0.42, 3.84, 0.53, 3.95, 0.55]
+    for name, initial_val in zip(param_names, initial_vals):
+        if result.params[name].vary:
+            final_val = result.params[name].value
+            change = ((final_val - initial_val) / initial_val) * 100
+            print(f"  {name}: {initial_val:.4f} → {final_val:.4f} ({change:+.1f}%)")
+else:
+    print("No optimization result available for summary statistics.")
